@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package traini;
+
+// ============================================================================
+// Common Types
+// ============================================================================
+
+// Empty message used for RPC calls that don't require request/response data
+message Empty {}
+
+// Unix timestamp with nanosecond precision for accurate timing
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}
+
+// ============================================================================
+// Conversation Service (Bidirectional Audio Streaming)
+// ============================================================================
+
+// Service for managing real-time bidirectional audio conversations
+service ConversationService {
+  // Bidirectional streaming: client sends audio chunks, server responds with various conversation events
+  rpc StreamConversation(stream AudioChunk) returns (stream ConversationEvent);
+  // Ends an active conversation and returns a summary of the session
+  rpc EndConversation(EndConversationRequest) returns (SessionSummary);
+}
+
+// A single chunk of audio data sent from client to server during streaming
+message AudioChunk {
+  bytes audio_data = 1;          // Raw audio data in bytes
+  AudioFormat format = 2;        // Audio format specification (sample rate, channels, etc.)
+  int64 sequence_number = 3;     // Sequential number for ordering chunks and detecting packet loss
+  Timestamp timestamp = 4;       // When this audio chunk was captured
+}
+
+// Specification of audio format parameters
+message AudioFormat {
+  int32 sample_rate = 1;  // Samples per second (e.g., 16000, 44100, 48000 Hz)
+  int32 channels = 2;     // Number of audio channels (1 = mono, 2 = stereo)
+  int32 bit_depth = 3;    // Bits per sample (e.g., 16, 24, 32)
+  string encoding = 4;    // Audio encoding format (e.g., "PCM", "OPUS", "AAC")
+}
+
+// Server-to-client event during conversation streaming (polymorphic event type)
+message ConversationEvent {
+  oneof event {
+    AudioOutput audio_output = 1;          // AI's audio response chunk
+    AudioComplete audio_complete = 2;      // Signal that audio output is complete
+    ErrorEvent error = 100;                // Error occurred during processing
+  }
+}
+
+// AI's audio response sent back to the client
+message AudioOutput {
+  bytes audio_data = 1;       // Raw audio data of the AI's speech
+  int64 sequence_number = 2;  // Sequential number for ordering output chunks
+}
+
+// Signal that the AI has finished speaking (no more audio chunks)
+message AudioComplete {
+  int64 total_chunks = 1;  // Total number of audio chunks sent in this response
+}
+
+// Error event with details about what went wrong
+message ErrorEvent {
+  string code = 1;     // Error code (e.g., "STT_FAILED", "MEMORY_ERROR")
+  string message = 2;  // Human-readable error message
+}
+
+// Request to end an active conversation session
+message EndConversationRequest {
+  string session_id = 1;  // Unique identifier for the conversation session
+}
+
+// Summary of a completed conversation session
+message SessionSummary {
+  string session_id = 1;  // Unique identifier for the session
+}
