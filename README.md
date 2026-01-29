@@ -25,7 +25,7 @@ protoc --proto_path=proto --python_out=. proto/conversation.proto
 
 ## Run
 ```bash
-GRPC_SERVER_HOST=54.145.170.41 GRPC_SERVER_PORT=50051 GRPC_ENABLED=1 \
+GRPC_SERVER_HOST=<your-grpc-host> GRPC_SERVER_PORT=50051 GRPC_ENABLED=1 \
 uvicorn audio_store_server:app --host 0.0.0.0 --port 8080
 ```
 
@@ -43,7 +43,7 @@ uvicorn audio_store_server:app --host 0.0.0.0 --port 8080
 - `X-Stream`: stream id (default `default`)
 
 ## Env Vars
-- `GRPC_SERVER_HOST` (default `54.145.170.41`)
+- `GRPC_SERVER_HOST` (required; no default)
 - `GRPC_SERVER_PORT` (default `50051`)
 - `GRPC_ENABLED` (default `1`)
 - `GRPC_AUDIO_ENCODING` (default `pcm16`)

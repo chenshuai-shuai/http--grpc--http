@@ -67,7 +67,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-GRPC_SERVER_HOST = os.environ.get("GRPC_SERVER_HOST", "54.145.170.41")
+GRPC_SERVER_HOST = os.environ.get("GRPC_SERVER_HOST", "")
 GRPC_SERVER_PORT = _env_int("GRPC_SERVER_PORT", 50051)
 GRPC_ENABLED = os.environ.get("GRPC_ENABLED", "1").strip() != "0"
 GRPC_AUDIO_ENCODING = os.environ.get("GRPC_AUDIO_ENCODING", "pcm16")
