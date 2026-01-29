@@ -24,6 +24,7 @@ import logging
 import os
 import queue
 import re
+import struct
 import threading
 import time
 from pathlib import Path
@@ -74,6 +75,240 @@ GRPC_AUDIO_ENCODING = os.environ.get("GRPC_AUDIO_ENCODING", "pcm16")
 GRPC_AUDIO_CHANNELS = _env_int("GRPC_AUDIO_CHANNELS", 1)
 GRPC_AUDIO_BIT_DEPTH = _env_int("GRPC_AUDIO_BIT_DEPTH", 16)
 GRPC_SESSION_IDLE_SEC = _env_int("GRPC_SESSION_IDLE_SEC", 120)
+
+DOWNLINK_ENABLED = os.environ.get("DOWNLINK_ENABLED", "1").strip() != "0"
+DOWNLINK_SAMPLE_RATE = _env_int("DOWNLINK_SAMPLE_RATE", DEFAULT_SR)
+DOWNLINK_CHANNELS = _env_int("DOWNLINK_CHANNELS", 1)
+DOWNLINK_BITS = _env_int("DOWNLINK_BITS", 16)
+DOWNLINK_HW_CHUNK_SIZE = _env_int("DOWNLINK_HW_CHUNK_SIZE", 2048)
+DOWNLINK_PACKET_MAGIC = os.environ.get("DOWNLINK_PACKET_MAGIC", "ATGW")
+DOWNLINK_STORE_DIR = os.environ.get("DOWNLINK_STORE_DIR", "").strip()
+DOWNLINK_STORE_LAST = os.environ.get("DOWNLINK_STORE_LAST", "1").strip() != "0"
+
+DOWNLINK_PACKET_VERSION = 1
+
+MSG_CONTROL = 1
+MSG_AUDIO = 2
+
+FLAG_FIRST = 0x01
+FLAG_LAST = 0x02
+
+CTRL_PLAYBACK_START = 1
+CTRL_PLAYBACK_DONE = 2
+CTRL_UPLINK_RESUME = 3
+
+
+def _downlink_magic_bytes() -> bytes:
+    raw = (DOWNLINK_PACKET_MAGIC or "ATGW").encode("ascii", "ignore")[:4]
+    return raw.ljust(4, b"_")
+
+
+DOWNLINK_MAGIC_BYTES = _downlink_magic_bytes()
+DOWNLINK_HEADER = struct.Struct("<4sBBHIBBHII")
+
+_CONTROL_SEQ = 0
+_CONTROL_SEQ_LOCK = threading.Lock()
+
+
+def _next_control_seq() -> int:
+    global _CONTROL_SEQ
+    with _CONTROL_SEQ_LOCK:
+        _CONTROL_SEQ += 1
+        return _CONTROL_SEQ
+
+
+def _build_packet_header(
+    msg_type: int,
+    flags: int,
+    seq: int,
+    payload_len: int,
+    sr: int = 0,
+    channels: int = 1,
+    bits: int = 16,
+) -> bytes:
+    return DOWNLINK_HEADER.pack(
+        DOWNLINK_MAGIC_BYTES,
+        DOWNLINK_PACKET_VERSION,
+        msg_type,
+        max(0, int(flags)) & 0xFFFF,
+        max(0, int(sr)),
+        max(0, min(255, int(channels))),
+        max(0, min(255, int(bits))),
+        0,
+        max(0, int(seq)),
+        max(0, int(payload_len)),
+    )
+
+
+def _build_control_packet(cmd: int, seq: int) -> bytes:
+    payload = bytes([max(0, min(255, int(cmd)))])
+    header = _build_packet_header(
+        MSG_CONTROL,
+        0,
+        seq,
+        len(payload),
+        sr=0,
+        channels=0,
+        bits=0,
+    )
+    return header + payload
+
+
+def _build_audio_packet(
+    pcm: bytes,
+    seq: int,
+    first: bool,
+    last: bool,
+    sr: int,
+    channels: int,
+    bits: int,
+) -> bytes:
+    flags = 0
+    if first:
+        flags |= FLAG_FIRST
+    if last:
+        flags |= FLAG_LAST
+    header = _build_packet_header(
+        MSG_AUDIO,
+        flags,
+        seq,
+        len(pcm),
+        sr=sr,
+        channels=channels,
+        bits=bits,
+    )
+    return header + pcm
+
+
+def _downlink_pcm_path(stream_id: str) -> Path:
+    if DOWNLINK_STORE_DIR:
+        out_dir = Path(DOWNLINK_STORE_DIR).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / f"{stream_id}_downlink_last.pcm"
+    return _ensure_stream_dir(stream_id) / "downlink_last.pcm"
+
+
+def _send_hw_control(stream_id: str, cmd: int) -> None:
+    seq = _next_control_seq()
+    packet = _build_control_packet(cmd, seq)
+    logging.info("hw control queued stream=%s cmd=%s seq=%s bytes=%s", stream_id, cmd, seq, len(packet))
+
+
+def _send_hw_audio(stream_id: str, pcm: bytes, sr: int, channels: int, bits: int) -> None:
+    if not pcm:
+        return
+    chunk_size = max(1, int(DOWNLINK_HW_CHUNK_SIZE))
+    total_packets = 0
+    total_chunks = (len(pcm) + chunk_size - 1) // chunk_size
+    for idx in range(total_chunks):
+        start = idx * chunk_size
+        end = min(len(pcm), start + chunk_size)
+        _build_audio_packet(
+            pcm[start:end],
+            seq=idx + 1,
+            first=(idx == 0),
+            last=(idx == total_chunks - 1),
+            sr=sr,
+            channels=channels,
+            bits=bits,
+        )
+        total_packets += 1
+    if DOWNLINK_STORE_LAST:
+        try:
+            _downlink_pcm_path(stream_id).write_bytes(pcm)
+        except Exception as exc:
+            logging.warning("downlink pcm store failed stream=%s err=%s", stream_id, exc)
+    logging.info(
+        "hw audio queued stream=%s bytes=%s packets=%s",
+        stream_id,
+        len(pcm),
+        total_packets,
+    )
+
+
+class _DownlinkState:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._mode = "uplink"
+        self._stream_id: Optional[str] = None
+        self._buffer = bytearray()
+        self._chunks = 0
+        self._last_start = None
+        self._last_complete = None
+        self._last_bytes = 0
+        self._last_total_chunks = 0
+
+    def mode(self) -> str:
+        with self._lock:
+            return self._mode
+
+    def is_uplink(self) -> bool:
+        with self._lock:
+            return self._mode == "uplink"
+
+    def start_if_needed(self, stream_id: str) -> bool:
+        with self._lock:
+            if self._mode != "uplink":
+                return False
+            self._mode = "downlink_collecting"
+            self._stream_id = stream_id
+            self._buffer.clear()
+            self._chunks = 0
+            self._last_start = time.time()
+            logging.info("downlink state uplink -> downlink_collecting stream=%s", stream_id)
+            return True
+
+    def append(self, stream_id: str, data: bytes) -> bool:
+        with self._lock:
+            if self._mode != "downlink_collecting" or self._stream_id != stream_id:
+                return False
+            self._buffer.extend(data)
+            self._chunks += 1
+            return True
+
+    def finish(self, stream_id: str, total_chunks: int) -> Optional[bytes]:
+        with self._lock:
+            if self._mode != "downlink_collecting" or self._stream_id != stream_id:
+                return None
+            payload = bytes(self._buffer)
+            self._buffer.clear()
+            self._mode = "downlink_playing"
+            self._last_complete = time.time()
+            self._last_bytes = len(payload)
+            self._last_total_chunks = total_chunks
+            logging.info(
+                "downlink state downlink_collecting -> downlink_playing stream=%s bytes=%s chunks=%s",
+                stream_id,
+                len(payload),
+                total_chunks,
+            )
+            return payload
+
+    def playback_done(self, stream_id: Optional[str]) -> bool:
+        with self._lock:
+            if self._mode != "downlink_playing":
+                return False
+            if stream_id and self._stream_id != stream_id:
+                return False
+            self._mode = "uplink"
+            self._stream_id = None
+            self._buffer.clear()
+            self._chunks = 0
+            logging.info("downlink state downlink_playing -> uplink stream=%s", stream_id or "current")
+            return True
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "mode": self._mode,
+                "stream": self._stream_id,
+                "buffer_bytes": len(self._buffer),
+                "chunks_received": self._chunks,
+                "last_start": self._last_start,
+                "last_complete": self._last_complete,
+                "last_bytes": self._last_bytes,
+                "last_total_chunks": self._last_total_chunks,
+            }
 
 
 def _sanitize_stream_id(raw: str) -> str:
@@ -222,12 +457,39 @@ class _GrpcConversationSession:
                 audio.sequence_number,
                 len(audio.audio_data),
             )
+            if DOWNLINK_ENABLED:
+                started = DOWNLINK_STATE.start_if_needed(self.stream_id)
+                if started:
+                    _send_hw_control(self.stream_id, CTRL_PLAYBACK_START)
+                accepted = DOWNLINK_STATE.append(self.stream_id, audio.audio_data)
+                if not accepted:
+                    logging.info(
+                        "downlink drop audio_output stream=%s mode=%s",
+                        self.stream_id,
+                        DOWNLINK_STATE.mode(),
+                    )
         elif kind == "audio_complete":
             logging.info(
                 "grpc audio_complete stream=%s total_chunks=%s",
                 self.stream_id,
                 event.audio_complete.total_chunks,
             )
+            if DOWNLINK_ENABLED:
+                payload = DOWNLINK_STATE.finish(self.stream_id, event.audio_complete.total_chunks)
+                if payload is None:
+                    logging.info(
+                        "downlink ignore audio_complete stream=%s mode=%s",
+                        self.stream_id,
+                        DOWNLINK_STATE.mode(),
+                    )
+                else:
+                    _send_hw_audio(
+                        self.stream_id,
+                        payload,
+                        DOWNLINK_SAMPLE_RATE,
+                        DOWNLINK_CHANNELS,
+                        DOWNLINK_BITS,
+                    )
         elif kind == "error":
             err = event.error
             logging.warning(
@@ -355,11 +617,30 @@ class _GrpcConversationManager:
 
 
 GRPC_MANAGER = _GrpcConversationManager()
+DOWNLINK_STATE = _DownlinkState()
 
 
 @app.get("/ping")
 async def ping():
     return {"ok": True}
+
+
+@app.get("/downlink/status")
+async def downlink_status():
+    return DOWNLINK_STATE.snapshot()
+
+
+@app.post("/downlink/complete")
+async def downlink_complete(
+    stream_id: Optional[str] = None,
+    x_stream: Optional[str] = Header(None, alias="X-Stream"),
+):
+    raw = stream_id or x_stream
+    sid = _sanitize_stream_id(raw) if raw else None
+    if DOWNLINK_STATE.playback_done(sid):
+        logging.info("downlink complete stream=%s -> uplink", sid or "current")
+        return JSONResponse({"ok": True, "stream": sid, "mode": DOWNLINK_STATE.mode()})
+    raise HTTPException(status_code=409, detail="downlink not active")
 
 
 @app.post("/audio")
@@ -375,6 +656,10 @@ async def upload_audio(
     except ClientDisconnect:
         logging.warning("client disconnected mid-upload")
         return Response(status_code=204)
+
+    if DOWNLINK_ENABLED and not DOWNLINK_STATE.is_uplink():
+        logging.info("uplink blocked: downlink active")
+        raise HTTPException(status_code=409, detail="downlink active")
 
     if not body:
         raise HTTPException(status_code=400, detail="empty body")
