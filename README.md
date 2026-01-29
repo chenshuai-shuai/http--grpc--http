@@ -25,7 +25,7 @@ protoc --proto_path=proto --python_out=. proto/conversation.proto
 
 ## Run
 ```bash
-GRPC_SERVER_HOST=<your-grpc-host> GRPC_SERVER_PORT=50051 GRPC_ENABLED=1 \
+GRPC_SERVER_HOST=35.168.3.114 GRPC_SERVER_PORT=50051 GRPC_ENABLED=1 \
 uvicorn audio_store_server:app --host 0.0.0.0 --port 8080
 ```
 
