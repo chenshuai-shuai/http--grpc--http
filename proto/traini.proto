@@ -1,0 +1,17 @@
+syntax = "proto3";
+package traini;
+
+service TrainiService {
+  rpc TranslateHumanToDog(HumanToDogRequest) returns (HumanToDogResponse);
+}
+
+message HumanToDogRequest {
+  string audio_base64 = 1;
+  string audio_format = 2;
+}
+
+message HumanToDogResponse {
+  bool success = 1;
+  string error_message = 2;
+  string audio_url = 3;
+}
